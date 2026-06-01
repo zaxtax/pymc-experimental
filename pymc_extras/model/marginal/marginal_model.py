@@ -49,6 +49,7 @@ from pymc_extras.model.marginal.distributions import (
     MarginalRV,
     NonSeparableLogpWarning,
     get_domain_of_finite_discrete_rv,
+    hmm_posterior_marginals,
     inline_ofg_outputs,
     reduce_batch_dependent_logps,
 )
@@ -433,113 +434,195 @@ def recover_marginals(
     rv_dims = {}
     for seed, var_name_to_recover in zip(seeds, var_names_to_recover):
         var_to_recover = unmarginal_model[var_name_to_recover]
+
+        is_markov_chain = isinstance(var_to_recover.owner.op, DiscreteMarkovChain)
         supported_dists = (Bernoulli, Categorical, DiscreteUniform)
-        if not isinstance(var_to_recover.owner.op, supported_dists):
+        is_finite_discrete = isinstance(var_to_recover.owner.op, supported_dists)
+
+        if not (is_markov_chain or is_finite_discrete):
             raise NotImplementedError(
                 f"RV with distribution {var_to_recover.owner.op} cannot be recovered. "
-                f"Supported distribution include {supported_dists}"
+                f"Supported distribution include {supported_dists} and DiscreteMarkovChain"
             )
 
         other_marginalized_rvs_names = marginalized_rv_names.copy()
         other_marginalized_rvs_names.remove(var_name_to_recover)
-        dependent_rvs = [
-            rv
-            for rv in find_conditional_dependent_rvs(var_to_recover, unmarginal_model.basic_RVs)
-            if rv.name not in other_marginalized_rvs_names
-        ]
-        # Handle batch dims for marginalized value and its dependent RVs
-        dependent_rvs_dim_connections = subgraph_batch_dim_connection(var_to_recover, dependent_rvs)
 
-        marginalized_model = marginalize(unmarginal_model, other_marginalized_rvs_names)
-
-        marginalized_var_to_recover = marginalized_model[var_name_to_recover]
-        dependent_rvs = [marginalized_model[rv.name] for rv in dependent_rvs]
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=NonSeparableLogpWarning)
-            logps = marginalized_model.logp(
-                vars=[marginalized_var_to_recover, *dependent_rvs], sum=False
-            )
-
-        marginalized_logp, *dependent_logps = logps
-        joint_logp = marginalized_logp + reduce_batch_dependent_logps(
-            dependent_rvs_dim_connections,
-            [dependent_var.owner.op for dependent_var in dependent_rvs],
-            dependent_logps,
-        )
-
-        marginalized_value = marginalized_model.rvs_to_values[marginalized_var_to_recover]
-        other_values = [v for v in marginalized_model.value_vars if v is not marginalized_value]
-
-        rv_shape = constant_fold(tuple(var_to_recover.shape), raise_not_constant=False)
-        rv_domain = get_domain_of_finite_discrete_rv(var_to_recover)
-        rv_domain_tensor = pt.moveaxis(
-            pt.full(
-                (*rv_shape, len(rv_domain)),
-                rv_domain,
-                dtype=var_to_recover.dtype,
-            ),
-            -1,
-            0,
-        )
-
-        batched_joint_logp = vectorize_graph(
-            joint_logp,
-            replace={marginalized_value: rv_domain_tensor},
-        )
-        batched_joint_logp = pt.moveaxis(batched_joint_logp, 0, -1)
-
-        joint_logp_norm = log_softmax(batched_joint_logp, axis=-1)
-        if return_samples:
-            rv_draws = Categorical.dist(logit_p=batched_joint_logp)
-            if isinstance(var_to_recover.owner.op, DiscreteUniform):
-                rv_draws += rv_domain[0]
-            outputs = [joint_logp_norm, rv_draws]
-        else:
-            outputs = joint_logp_norm
-
-        rv_loglike_fn = compile_pymc(
-            inputs=other_values,
-            outputs=outputs,
-            on_unused_input="ignore",
-            random_seed=seed,
-        )
-
-        logvs = [rv_loglike_fn(**vs) for vs in transformed_posterior_pts]
-
-        if return_samples:
-            logps, samples = zip(*logvs)
-            logps = np.asarray(logps)
-            samples = np.asarray(samples)
-            rv_dict[var_name_to_recover] = samples.reshape(
-                tuple(len(coord) for coord in stacked_dims.values()) + samples.shape[1:],
-            )
-        else:
-            logps = np.asarray(logvs)
-
-        rv_dict["lp_" + var_name_to_recover] = logps.reshape(
-            tuple(len(coord) for coord in stacked_dims.values()) + logps.shape[1:],
-        )
-        if var_name_to_recover in unmarginal_model.named_vars_to_dims:
-            rv_dims[var_name_to_recover] = list(
-                unmarginal_model.named_vars_to_dims[var_name_to_recover]
-            )
-            rv_dims["lp_" + var_name_to_recover] = rv_dims[var_name_to_recover] + [
-                "lp_" + var_name_to_recover + "_dim"
+        if is_markov_chain:
+            # ---- HMM recovery path (forward-backward + optional FFBS) ----
+            dependent_rvs = [
+                rv
+                for rv in find_conditional_dependent_rvs(var_to_recover, unmarginal_model.basic_RVs)
+                if rv.name not in other_marginalized_rvs_names
             ]
+
+            marginalized_model = marginalize(unmarginal_model, other_marginalized_rvs_names)
+
+            chain_rv = marginalized_model[var_name_to_recover]
+            dep_rvs_in_marginal = [marginalized_model[rv.name] for rv in dependent_rvs]
+            dep_values = [marginalized_model.rvs_to_values[rv] for rv in dep_rvs_in_marginal]
+
+            marginalized_value = marginalized_model.rvs_to_values[chain_rv]
+            other_values = [v for v in marginalized_model.value_vars if v is not marginalized_value]
+
+            dims_connections = subgraph_batch_dim_connection(var_to_recover, dependent_rvs)
+
+            outputs = hmm_posterior_marginals(
+                chain_rv=chain_rv,
+                dependent_rvs=dep_rvs_in_marginal,
+                dims_connections=dims_connections,
+                dep_values=dep_values,
+                return_samples=return_samples,
+            )
+
+            rv_loglike_fn = compile_pymc(
+                inputs=other_values,
+                outputs=outputs if return_samples else (outputs,),
+                on_unused_input="ignore",
+                random_seed=seed,
+            )
+
+            logvs = [rv_loglike_fn(**vs) for vs in transformed_posterior_pts]
+
+            if return_samples:
+                logps, samples_ = zip(*logvs)
+                logps = np.asarray(logps)
+                samples_ = np.asarray(samples_)
+                rv_dict[var_name_to_recover] = samples_.reshape(
+                    tuple(len(coord) for coord in stacked_dims.values()) + samples_.shape[1:],
+                )
+            else:
+                logps = np.asarray(logvs)
+
+            rv_dict["lp_" + var_name_to_recover] = logps.reshape(
+                tuple(len(coord) for coord in stacked_dims.values()) + logps.shape[1:],
+            )
+
+            if var_name_to_recover in unmarginal_model.named_vars_to_dims:
+                rv_dims[var_name_to_recover] = list(
+                    unmarginal_model.named_vars_to_dims[var_name_to_recover]
+                )
+                rv_dims["lp_" + var_name_to_recover] = rv_dims[var_name_to_recover] + [
+                    "lp_" + var_name_to_recover + "_dim"
+                ]
+
+        else:
+            # ---- Existing finite discrete recovery path ----
+            dependent_rvs = [
+                rv
+                for rv in find_conditional_dependent_rvs(var_to_recover, unmarginal_model.basic_RVs)
+                if rv.name not in other_marginalized_rvs_names
+            ]
+            # Handle batch dims for marginalized value and its dependent RVs
+            dependent_rvs_dim_connections = subgraph_batch_dim_connection(
+                var_to_recover, dependent_rvs
+            )
+
+            marginalized_model = marginalize(unmarginal_model, other_marginalized_rvs_names)
+
+            marginalized_var_to_recover = marginalized_model[var_name_to_recover]
+            dependent_rvs = [marginalized_model[rv.name] for rv in dependent_rvs]
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=NonSeparableLogpWarning)
+                logps = marginalized_model.logp(
+                    vars=[marginalized_var_to_recover, *dependent_rvs], sum=False
+                )
+
+            marginalized_logp, *dependent_logps = logps
+            joint_logp = marginalized_logp + reduce_batch_dependent_logps(
+                dependent_rvs_dim_connections,
+                [dependent_var.owner.op for dependent_var in dependent_rvs],
+                dependent_logps,
+            )
+
+            marginalized_value = marginalized_model.rvs_to_values[marginalized_var_to_recover]
+            other_values = [v for v in marginalized_model.value_vars if v is not marginalized_value]
+
+            rv_shape = constant_fold(tuple(var_to_recover.shape), raise_not_constant=False)
+            rv_domain = get_domain_of_finite_discrete_rv(var_to_recover)
+            rv_domain_tensor = pt.moveaxis(
+                pt.full(
+                    (*rv_shape, len(rv_domain)),
+                    rv_domain,
+                    dtype=var_to_recover.dtype,
+                ),
+                -1,
+                0,
+            )
+
+            batched_joint_logp = vectorize_graph(
+                joint_logp,
+                replace={marginalized_value: rv_domain_tensor},
+            )
+            batched_joint_logp = pt.moveaxis(batched_joint_logp, 0, -1)
+
+            joint_logp_norm = log_softmax(batched_joint_logp, axis=-1)
+            if return_samples:
+                rv_draws = Categorical.dist(logit_p=batched_joint_logp)
+                if isinstance(var_to_recover.owner.op, DiscreteUniform):
+                    rv_draws += rv_domain[0]
+                outputs = [joint_logp_norm, rv_draws]
+            else:
+                outputs = joint_logp_norm
+
+            rv_loglike_fn = compile_pymc(
+                inputs=other_values,
+                outputs=outputs,
+                on_unused_input="ignore",
+                random_seed=seed,
+            )
+
+            logvs = [rv_loglike_fn(**vs) for vs in transformed_posterior_pts]
+
+            if return_samples:
+                logps, samples = zip(*logvs)
+                logps = np.asarray(logps)
+                samples = np.asarray(samples)
+                rv_dict[var_name_to_recover] = samples.reshape(
+                    tuple(len(coord) for coord in stacked_dims.values()) + samples.shape[1:],
+                )
+            else:
+                logps = np.asarray(logvs)
+
+            rv_dict["lp_" + var_name_to_recover] = logps.reshape(
+                tuple(len(coord) for coord in stacked_dims.values()) + logps.shape[1:],
+            )
+            if var_name_to_recover in unmarginal_model.named_vars_to_dims:
+                rv_dims[var_name_to_recover] = list(
+                    unmarginal_model.named_vars_to_dims[var_name_to_recover]
+                )
+                rv_dims["lp_" + var_name_to_recover] = rv_dims[var_name_to_recover] + [
+                    "lp_" + var_name_to_recover + "_dim"
+                ]
 
     coords, dims = coords_and_dims_for_inferencedata(unmarginal_model)
     dims.update(rv_dims)
+
+    # Use non-colliding sample dim names so that data variables named
+    # "chain" or "draw" aren't silently converted to coordinates.
+    _sample_dims = tuple(f"_{d}_" if d in rv_dict else d for d in stacked_dims.keys())
+
     rv_dataset = dict_to_dataset(
         rv_dict,
         inference_library=pymc,
         dims=dims,
         coords=coords,
+        sample_dims=_sample_dims,
         skip_event_dims=True,
     )
 
     if extend_inferencedata:
-        idata["posterior"] = idata["posterior"].assign(rv_dataset)
+        posterior = idata["posterior"]
+        posterior_ds = posterior.dataset
+        # Resolve collisions: if a recovered variable name collides with
+        # an existing coordinate (e.g., "chain" variable vs chain-index coord),
+        # rename the existing coord to avoid an xarray merge error.
+        conflicts = set(rv_dataset.data_vars) & set(posterior_ds.coords)
+        if conflicts:
+            rename_map = {c: f"_{c}_" for c in conflicts}
+            posterior_ds = posterior_ds.rename(rename_map)
+        idata["posterior"] = posterior_ds.assign(rv_dataset)
         return idata
     else:
         return rv_dataset

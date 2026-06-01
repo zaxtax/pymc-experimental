@@ -3,6 +3,7 @@ import warnings
 from collections.abc import Sequence
 
 import numpy as np
+import pytensor
 import pytensor.tensor as pt
 
 from pymc.distributions import Bernoulli, Categorical, DiscreteUniform
@@ -303,44 +304,215 @@ def finite_discrete_marginal_rv_logp(op: MarginalFiniteDiscreteRV, values, *inpu
     return joint_logp, *dummy_logps
 
 
+def _compute_hmm_emission_logp(chain_rv, dependent_rvs, dims_connections, values):
+    """Compute emission log-probabilities for every possible state at each time step.
+
+    Parameters
+    ----------
+    chain_rv : TensorVariable
+        The DiscreteMarkovChain random variable.
+    dependent_rvs : list of TensorVariable
+        Dependent (emission) random variables.
+    dims_connections : list of tuple
+        Batch dimension mappings between chain and each dependent RV.
+    values : list of TensorVariable
+        Value variables for the dependent RVs.
+
+    Returns
+    -------
+    batch_logp_emissions : TensorVariable
+        Shape (n_states, *batch_dims, n_steps). Logp of emissions for each state at each step.
+    batch_chain_value : TensorVariable
+        Shape (n_states, *chain_shape). Domain values broadcast to chain shape, used for
+        vectorizing init-distribution logp.
+    """
+    P = chain_rv.owner.inputs[0]
+    domain = pt.arange(P.shape[-1], dtype="int32")
+
+    # Break dependency between chain and dependent RVs
+    chain_value = chain_rv.clone()
+    dependent_rvs_clone = clone_replace(dependent_rvs, {chain_rv: chain_value})
+    logp_emissions_dict = conditional_logp(dict(zip(dependent_rvs_clone, values)))
+
+    # Reduce and add the batch dims beyond the chain dimension
+    reduced_logp_emissions = reduce_batch_dependent_logps(
+        dependent_dims_connections=dims_connections,
+        dependent_ops=[dependent_rv.owner.op for dependent_rv in dependent_rvs_clone],
+        dependent_logps=[logp_emissions_dict[value] for value in values],
+    )
+
+    # Vectorize over the domain of the chain
+    chain_shape = constant_fold(tuple(chain_rv.shape))
+    batch_chain_value = pt.moveaxis(pt.full((*chain_shape, domain.size), domain), -1, 0)
+    batch_logp_emissions = vectorize_graph(reduced_logp_emissions, {chain_value: batch_chain_value})
+
+    return batch_logp_emissions, batch_chain_value
+
+
+def _hmm_forward_backward(batch_logp_emissions, batch_logp_init_dist, log_P, return_samples=False):
+    """Run forward-backward on precomputed emission log-probabilities.
+
+    Parameters
+    ----------
+    batch_logp_emissions : TensorVariable
+        Shape (n_states, *batch, n_steps). Emission log-probs for each state and step.
+    batch_logp_init_dist : TensorVariable
+        Shape (n_states, *batch). Initial state log-probabilities.
+    log_P : TensorVariable
+        Shape (n_states, n_states, *batch). Log transition matrix.
+    return_samples : bool
+        If True, also return FFBS samples.
+
+    Returns
+    -------
+    log_gamma : TensorVariable
+        Posterior marginal log-probabilities: (*batch, n_steps, n_states).
+    samples : TensorVariable (if return_samples=True)
+        Sampled state sequences: (*batch, n_steps).
+    """
+    from pytensor.tensor.special import log_softmax
+
+    # ----- Forward pass (alpha) -----
+    # alpha_0(j) = log pi_j + log b_j(o_0)
+    log_alpha_0 = batch_logp_init_dist + batch_logp_emissions[..., 0]
+
+    def step_alpha(logp_emission, log_alpha, log_P):
+        step_log_prob = pt.logsumexp(log_alpha[:, None, ...] + log_P, axis=0)
+        return logp_emission + step_log_prob
+
+    log_alpha_seq = scan(
+        step_alpha,
+        non_sequences=[log_P],
+        outputs_info=[log_alpha_0],
+        sequences=pt.moveaxis(batch_logp_emissions[..., 1:], -1, 0),
+        return_updates=False,
+    )
+    log_alphas = pt.concatenate([log_alpha_0[None, ...], log_alpha_seq], axis=0)
+
+    # ----- Backward pass (beta) -----
+    log_beta_T = pt.zeros_like(log_alpha_0)
+
+    def step_beta(logp_emission, log_beta, log_P):
+        return pt.logsumexp(log_P + logp_emission[None, ...] + log_beta[None, ...], axis=1)
+
+    rev_emissions = batch_logp_emissions[..., :0:-1]
+
+    log_beta_seq = scan(
+        step_beta,
+        non_sequences=[log_P],
+        outputs_info=[log_beta_T],
+        sequences=pt.moveaxis(rev_emissions, -1, 0),
+        return_updates=False,
+    )
+    log_betas = pt.concatenate([log_beta_seq[::-1], log_beta_T[None, ...]], axis=0)
+
+    # ----- Posterior marginals (gamma) -----
+    log_gamma = log_alphas + log_betas
+    log_gamma = log_softmax(log_gamma, axis=1)
+    log_gamma = pt.moveaxis(pt.moveaxis(log_gamma, 1, -1), 0, -2)
+
+    if not return_samples:
+        return log_gamma
+
+    # ----- FFBS -----
+    ffbs_rng = pytensor.shared(np.random.default_rng())
+
+    p_last = log_softmax(log_alphas[-1], axis=0)
+    _, last_state = Categorical.dist(logit_p=p_last.T, rng=ffbs_rng, return_next_rng=True)
+
+    rev_alphas = log_alphas[:-1][::-1]
+
+    def step_ffbs(log_alpha_t, rng, prev_state, log_P):
+        log_trans_to_prev = log_P[:, prev_state]
+        log_prob = log_softmax(log_alpha_t + log_trans_to_prev, axis=0)
+        next_rng, state = Categorical.dist(logit_p=log_prob.T, rng=rng, return_next_rng=True)
+        return next_rng, state
+
+    _, rev_states = scan(
+        step_ffbs,
+        non_sequences=[log_P],
+        outputs_info=[ffbs_rng, last_state],
+        sequences=[rev_alphas],
+        return_updates=False,
+    )
+    states = pt.concatenate([rev_states[::-1], last_state[None, ...]], axis=0)
+    samples = pt.moveaxis(states, 0, -1)
+
+    return log_gamma, samples
+
+
+def _prepare_hmm_quantities(chain_rv, batch_chain_value):
+    """Compute log initial distribution and log transition matrix."""
+    P, n_steps_, init_dist_, rng = chain_rv.owner.inputs
+    chain_shape = constant_fold(tuple(chain_rv.shape))
+
+    # Initial distribution logp
+    init_dist_value = init_dist_.type()
+    logp_init_dist = logp(init_dist_, init_dist_value)
+    batch_logp_init_dist = vectorize_graph(
+        logp_init_dist, {init_dist_value: batch_chain_value[..., :1]}
+    ).squeeze(-1)
+
+    # Log transition matrix: move core dims to front
+    P = pt.atleast_Nd(P, n=len(chain_shape) + 1)
+    P = pt.moveaxis(P, (-2, -1), (0, 1))
+    log_P = pt.log(P)
+
+    return batch_logp_init_dist, log_P
+
+
+def hmm_posterior_marginals(
+    chain_rv, dependent_rvs, dims_connections, dep_values, *, return_samples=False
+):
+    """Compute posterior state marginals and optionally samples for a DiscreteMarkovChain.
+
+    Parameters
+    ----------
+    chain_rv : TensorVariable
+        The DiscreteMarkovChain random variable.
+    dependent_rvs : list of TensorVariable
+        Dependent (emission) random variables.
+    dims_connections : list of tuple
+        Batch dimension mappings from chain to each dependent RV.
+    dep_values : list of TensorVariable
+        Value variables for the dependent RVs.
+    return_samples : bool
+        If True, also return sampled state sequences via FFBS.
+
+    Returns
+    -------
+    log_gamma : TensorVariable
+        Posterior marginal log-probabilities: (*batch, n_steps, n_states).
+    samples : TensorVariable (if return_samples=True)
+        Sampled state sequences: (*batch, n_steps).
+    """
+    batch_logp_emissions, batch_chain_value = _compute_hmm_emission_logp(
+        chain_rv, dependent_rvs, dims_connections, dep_values
+    )
+    batch_logp_init_dist, log_P = _prepare_hmm_quantities(chain_rv, batch_chain_value)
+    return _hmm_forward_backward(
+        batch_logp_emissions, batch_logp_init_dist, log_P, return_samples=return_samples
+    )
+
+
 @_logprob.register(MarginalDiscreteMarkovChainRV)
 def marginal_hmm_logp(op, values, *inputs, **kwargs):
     chain_rv, *dependent_rvs = inline_ofg_outputs(op, inputs)
 
     P, n_steps_, init_dist_, rng = chain_rv.owner.inputs
-    domain = pt.arange(P.shape[-1], dtype="int32")
+    chain_shape = constant_fold(tuple(chain_rv.shape))
 
-    # Construct logp in two steps
-    # Step 1: Compute the probability of the data ("emissions") under every possible state (vec_logp_emission)
-
-    # First we need to vectorize the conditional logp graph of the data, in case there are batch dimensions floating
-    # around. To do this, we need to break the dependency between chain and the init_dist_ random variable. Otherwise,
-    # PyMC will detect a random variable in the logp graph (init_dist_), that isn't relevant at this step.
-    chain_value = chain_rv.clone()
-    dependent_rvs = clone_replace(dependent_rvs, {chain_rv: chain_value})
-    logp_emissions_dict = conditional_logp(dict(zip(dependent_rvs, values)))
-
-    # Reduce and add the batch dims beyond the chain dimension
-    reduced_logp_emissions = reduce_batch_dependent_logps(
-        dependent_dims_connections=op.dims_connections,
-        dependent_ops=[dependent_rv.owner.op for dependent_rv in dependent_rvs],
-        dependent_logps=[logp_emissions_dict[value] for value in values],
+    # Step 1: Compute emission log-probabilities
+    batch_logp_emissions, batch_chain_value = _compute_hmm_emission_logp(
+        chain_rv, dependent_rvs, op.dims_connections, values
     )
 
-    # Add a batch dimension for the domain of the chain
-    chain_shape = constant_fold(tuple(chain_rv.shape))
-    batch_chain_value = pt.moveaxis(pt.full((*chain_shape, domain.size), domain), -1, 0)
-    batch_logp_emissions = vectorize_graph(reduced_logp_emissions, {chain_value: batch_chain_value})
+    # Step 2: Compute the transition probabilities via the forward algorithm
+    # alpha_t = p(y | s_t) * sum_{s_{t-1}}(p(s_t | s_{t-1}) * alpha_{t-1})
 
-    # Step 2: Compute the transition probabilities
-    # This is the "forward algorithm", alpha_t = p(y | s_t) * sum_{s_{t-1}}(p(s_t | s_{t-1}) * alpha_{t-1})
-    # We do it entirely in logs, though.
-
-    # To compute the prior probabilities of each state, we evaluate the logp of the domain (all possible states)
-    # under the initial distribution. This is robust to everything the user can throw at it.
+    # Compute initial logp
     init_dist_value = init_dist_.type()
     logp_init_dist = logp(init_dist_, init_dist_value)
-    # Squeeze core dimension for n_lags=1 (only supported case)
     batch_logp_init_dist = vectorize_graph(
         logp_init_dist, {init_dist_value: batch_chain_value[..., :1]}
     ).squeeze(-1)
@@ -359,7 +531,6 @@ def marginal_hmm_logp(op, values, *inputs, **kwargs):
         step_alpha,
         non_sequences=[log_P],
         outputs_info=[log_alpha_init],
-        # Scan needs the time dimension first, and we already consumed the 1st logp computing the initial value
         sequences=pt.moveaxis(batch_logp_emissions[..., 1:], -1, 0),
         return_updates=False,
     )
